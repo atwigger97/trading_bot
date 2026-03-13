@@ -148,8 +148,8 @@ def normalize_clob_market(raw: dict) -> dict | None:
         "days_to_resolution": days,
         "active":             1 if raw.get("active", True) else 0,
         "closed":             1 if raw.get("closed", False) else 0,
-        "volume_24h_usdc":    float(raw.get("volume_24h", 0) or 0),
-        "liquidity_usdc":     float(raw.get("liquidity", 0) or 0),
+        "volume_24h_usdc":    0,  # CLOB API does not provide volume
+        "liquidity_usdc":     0,  # CLOB API does not provide liquidity
         "yes_token_id":       _extract_token_id(tokens, "YES"),
         "no_token_id":        _extract_token_id(tokens, "NO"),
         "yes_price":          yes_price,
@@ -158,27 +158,69 @@ def normalize_clob_market(raw: dict) -> dict | None:
     }
 
 
-def merge_gamma_metadata(market: dict, gamma_data: dict) -> dict:
+def normalize_gamma_market(raw: dict) -> dict | None:
     """
-    Enrich a normalized CLOB market with Gamma metadata.
-    Gamma has better volume and category data.
+    Convert raw Gamma API market dict → normalized market dict.
+    Gamma returns richer data: volume, liquidity, prices as JSON strings.
+    Returns None if market should be skipped.
     """
-    if not gamma_data:
-        return market
+    condition_id = raw.get("conditionId")
+    if not condition_id:
+        return None
 
-    # Prefer Gamma's volume (more accurate)
-    gamma_vol = float(gamma_data.get("volume24hr", 0) or 0)
-    if gamma_vol > 0:
-        market["volume_24h_usdc"] = gamma_vol
+    # Parse JSON-encoded fields
+    try:
+        outcomes = json.loads(raw.get("outcomes", "[]"))
+        prices   = json.loads(raw.get("outcomePrices", "[]"))
+        token_ids = json.loads(raw.get("clobTokenIds", "[]"))
+    except (json.JSONDecodeError, TypeError):
+        return None
 
-    # Gamma has cleaner category tags
-    category = gamma_data.get("category") or gamma_data.get("tags", [{}])
-    if isinstance(category, list) and category:
-        market["category"] = category[0].get("slug", market["category"])
-    elif isinstance(category, str):
-        market["category"] = category
+    if len(outcomes) < 2 or len(prices) < 2:
+        return None
 
-    return market
+    # Map outcomes to YES/NO prices and token IDs
+    yes_price = no_price = None
+    yes_token = no_token = None
+    for i, outcome in enumerate(outcomes):
+        if outcome.lower() == "yes":
+            yes_price = float(prices[i])
+            yes_token = token_ids[i] if i < len(token_ids) else None
+        elif outcome.lower() == "no":
+            no_price = float(prices[i])
+            no_token = token_ids[i] if i < len(token_ids) else None
+
+    if yes_price is None or no_price is None:
+        return None  # non-binary market (e.g. multi-outcome)
+
+    end_date = raw.get("endDate") or raw.get("endDateIso")
+    days     = _days_until(end_date)
+
+    # Extract category from events if available
+    category = raw.get("category") or ""
+    if not category:
+        events = raw.get("events", [])
+        if events and isinstance(events, list):
+            series = events[0].get("series", [])
+            if series:
+                category = series[0].get("slug", "")
+
+    return {
+        "condition_id":       condition_id,
+        "question":           raw.get("question", ""),
+        "category":           category,
+        "end_date_iso":       end_date,
+        "days_to_resolution": days,
+        "active":             1 if raw.get("active", True) else 0,
+        "closed":             1 if raw.get("closed", False) else 0,
+        "volume_24h_usdc":    float(raw.get("volume24hr") or raw.get("volumeNum") or 0),
+        "liquidity_usdc":     float(raw.get("liquidityNum") or raw.get("liquidityClob") or raw.get("liquidity") or 0),
+        "yes_token_id":       yes_token,
+        "no_token_id":        no_token,
+        "yes_price":          yes_price,
+        "no_price":           no_price,
+        "raw_json":           json.dumps(raw),
+    }
 
 
 # ─── FILTER ──────────────────────────────────────────────────────────────────
@@ -213,7 +255,7 @@ def passes_filter(market: dict) -> bool:
 
 def ingest_all_markets(max_markets: int = None) -> int:
     """
-    Full ingestion: paginate CLOB API → normalize → filter → persist.
+    Full ingestion: paginate Gamma API → normalize → filter → persist.
     Returns count of markets saved.
     """
     max_markets = max_markets or FILTER.max_markets_to_scan
@@ -221,13 +263,13 @@ def ingest_all_markets(max_markets: int = None) -> int:
 
     saved      = 0
     scanned    = 0
-    next_cursor = ""
+    offset     = 0
 
     logger.info(f"Starting market ingestion (target: {max_markets} markets)")
 
     while scanned < max_markets:
         page_size = min(FILTER.markets_per_page, max_markets - scanned)
-        markets, next_cursor = fetch_clob_markets(limit=page_size, next_cursor=next_cursor)
+        markets = fetch_gamma_markets(offset=offset, limit=page_size)
 
         if not markets:
             logger.warning("Empty page received — stopping ingestion")
@@ -235,16 +277,17 @@ def ingest_all_markets(max_markets: int = None) -> int:
 
         for raw in markets:
             scanned += 1
-            normalized = normalize_clob_market(raw)
+            normalized = normalize_gamma_market(raw)
             if normalized is None:
                 continue
             if passes_filter(normalized):
                 upsert_market(normalized)
                 saved += 1
 
-        logger.info(f"Scanned {scanned} | Saved {saved} | cursor={next_cursor[:20] if next_cursor else 'END'}")
+        offset += len(markets)
+        logger.info(f"Scanned {scanned} | Saved {saved} | offset={offset}")
 
-        if not next_cursor:
+        if len(markets) < page_size:
             break
 
         time.sleep(0.2)  # be polite to the API

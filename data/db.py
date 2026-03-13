@@ -164,8 +164,8 @@ def upsert_market(market: dict):
             ON CONFLICT(condition_id) DO UPDATE SET
                 yes_price        = excluded.yes_price,
                 no_price         = excluded.no_price,
-                volume_24h_usdc  = excluded.volume_24h_usdc,
-                liquidity_usdc   = excluded.liquidity_usdc,
+                volume_24h_usdc  = CASE WHEN excluded.volume_24h_usdc > 0 THEN excluded.volume_24h_usdc ELSE markets.volume_24h_usdc END,
+                liquidity_usdc   = CASE WHEN excluded.liquidity_usdc > 0 THEN excluded.liquidity_usdc ELSE markets.liquidity_usdc END,
                 active           = excluded.active,
                 closed           = excluded.closed,
                 last_updated     = datetime('now')
