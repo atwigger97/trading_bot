@@ -1,12 +1,12 @@
 """
-agents/research_agent.py — Sentiment research across Twitter, Reddit, and RSS.
+agents/research_agent.py — Sentiment research across Google News, Reddit, and RSS.
 
 For each market, searches relevant content from three sources,
 scores each using a VADER + FinBERT ensemble, and persists results
 to the sentiment table via db.save_sentiment().
 
 Public API (called by run_bot._process_market):
-    get_sentiment(market) → {"twitter": float, "reddit": float,
+    get_sentiment(market) → {"news": float, "reddit": float,
                               "rss": float, "composite": float}
 
 Each score in range [-1.0, +1.0].
@@ -25,7 +25,6 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from transformers import pipeline as hf_pipeline
 
 from config import (
-    TWITTER_BEARER_TOKEN,
     REDDIT_CLIENT_ID,
     REDDIT_CLIENT_SECRET,
     REDDIT_USER_AGENT,
@@ -117,35 +116,25 @@ def _extract_keywords(question: str) -> list[str]:
     return [t for t in tokens if len(t) >= 3 and t.lower() not in stop_words][:8]
 
 
-# ─── TWITTER ─────────────────────────────────────────────────────────────────
+# ─── GOOGLE NEWS ─────────────────────────────────────────────────────────────
 
-def _search_twitter(query: str, max_results: int = 20) -> list[str]:
+def _search_google_news(query: str, max_results: int = 15) -> list[str]:
     """
-    Search recent tweets (last 24h) via Twitter API v2.
-    Returns list of tweet texts. Gracefully skips on errors.
+    Search Google News RSS for recent articles matching query.
+    Returns list of 'title. summary' strings.
     """
-    if not TWITTER_BEARER_TOKEN:
-        logger.debug("Twitter: no bearer token, skipping")
-        return []
-
-    url = "https://api.twitter.com/2/tweets/search/recent"
-    headers = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
-    params = {
-        "query": f"{query} -is:retweet lang:en",
-        "max_results": min(max_results, 100),
-        "tweet.fields": "text",
-    }
-
+    from urllib.parse import quote_plus
+    url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=en-US&gl=US&ceid=US:en"
     try:
-        resp = requests.get(url, headers=headers, params=params, timeout=15)
-        if resp.status_code == 429:
-            logger.warning("Twitter: rate limited, skipping")
-            return []
-        resp.raise_for_status()
-        data = resp.json()
-        return [t["text"] for t in data.get("data", []) if "text" in t]
-    except requests.exceptions.RequestException as e:
-        logger.warning(f"Twitter search failed: {e}")
+        feed = feedparser.parse(url)
+        texts = []
+        for entry in feed.entries[:max_results]:
+            title = entry.get("title", "")
+            summary = entry.get("summary", "")[:300]
+            texts.append(f"{title}. {summary}".strip())
+        return texts
+    except Exception as e:
+        logger.warning(f"Google News search failed: {e}")
         return []
 
 
@@ -267,20 +256,20 @@ def get_sentiment(market: dict) -> dict:
     logger.debug(f"[{condition_id[:8]}] Research keywords: {keywords}")
 
     # ── Fetch texts ───────────────────────────────────────────────────────
-    twitter_texts = _search_twitter(query_str)
+    news_texts    = _search_google_news(query_str)
     reddit_texts  = _search_reddit(query_str, category=category)
     rss_texts     = _search_rss(keywords)
 
     # ── Score each source ─────────────────────────────────────────────────
-    twitter_score = _avg_score(twitter_texts)
+    news_score    = _avg_score(news_texts)
     reddit_score  = _avg_score(reddit_texts)
     rss_score     = _avg_score(rss_texts)
 
     # ── Weighted composite (only from sources that returned data) ─────────
-    weights = {"twitter": 0.40, "reddit": 0.35, "rss": 0.25}
+    weights = {"news": 0.45, "reddit": 0.30, "rss": 0.25}
     active = {}
-    if twitter_texts:
-        active["twitter"] = twitter_score
+    if news_texts:
+        active["news"] = news_score
     if reddit_texts:
         active["reddit"] = reddit_score
     if rss_texts:
@@ -295,14 +284,14 @@ def get_sentiment(market: dict) -> dict:
     composite = max(-1.0, min(1.0, composite))
 
     result = {
-        "twitter":   round(twitter_score, 4),
+        "news":      round(news_score, 4),
         "reddit":    round(reddit_score, 4),
         "rss":       round(rss_score, 4),
         "composite": round(composite, 4),
     }
 
     # ── Persist to sentiment table ────────────────────────────────────────
-    for source, texts, score in [("twitter", twitter_texts, twitter_score),
+    for source, texts, score in [("news",   news_texts,   news_score),
                                   ("reddit", reddit_texts, reddit_score),
                                   ("rss",    rss_texts,    rss_score)]:
         try:
@@ -318,7 +307,7 @@ def get_sentiment(market: dict) -> dict:
 
     logger.info(
         f"[{condition_id[:8]}] Sentiment — "
-        f"tw={result['twitter']:+.3f}({len(twitter_texts)}) "
+        f"news={result['news']:+.3f}({len(news_texts)}) "
         f"rd={result['reddit']:+.3f}({len(reddit_texts)}) "
         f"rss={result['rss']:+.3f}({len(rss_texts)}) "
         f"→ composite={result['composite']:+.3f}"

@@ -45,7 +45,9 @@ def _load_model():
     if os.path.exists(_MODEL_PATH):
         try:
             with open(_MODEL_PATH, "rb") as f:
-                _xgb_model = pickle.load(f)
+                data = pickle.load(f)
+            # Pickle stores {"model": ..., "metrics": ...} — extract just the model
+            _xgb_model = data["model"] if isinstance(data, dict) else data
             logger.info("XGBoost model loaded")
             return _xgb_model
         except Exception as e:
@@ -82,6 +84,7 @@ def _build_features(market: dict, sentiment: dict) -> dict:
         "days_to_resolution":   market.get("days_to_resolution") or 15,
         "sentiment_composite":  sentiment.get("composite", 0.0),
         "category_encoded":     _encode_category(market.get("category", "")),
+        "category":             market.get("category", ""),
     }
 
 
@@ -103,14 +106,19 @@ def _xgb_predict(features: dict) -> Optional[float]:
         return None
     try:
         import numpy as np
-        vec = np.array([[
-            features["yes_price"],
-            features["volume_24h"],
-            features["liquidity"],
-            features["days_to_resolution"],
-            features["sentiment_composite"],
-            features["category_encoded"],
-        ]])
+        import sys
+        import os as _os
+        # Import build_features from files/xgboost_model.py which matches training
+        sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+        from files.xgboost_model import build_features
+        market_like = {
+            "yes_price":          features["yes_price"],
+            "liquidity_usdc":     features["liquidity"],
+            "volume_24h_usdc":    features["volume_24h"],
+            "days_to_resolution": features["days_to_resolution"],
+            "category":           features.get("category", ""),
+        }
+        vec = build_features(market_like, features["sentiment_composite"]).reshape(1, -1)
         prob = float(model.predict_proba(vec)[0][1])
         return max(0.01, min(0.99, prob))
     except Exception as e:
@@ -119,6 +127,52 @@ def _xgb_predict(features: dict) -> Optional[float]:
 
 
 # ─── CLAUDE CALIBRATION ─────────────────────────────────────────────────────
+
+_CATEGORY_PROMPTS = {
+    "crypto": (
+        "You are a crypto market specialist. You have deep knowledge of Bitcoin, "
+        "Ethereum, and altcoin price dynamics. Key factors: current market regime "
+        "(bull/bear), BTC dominance and correlation, macro factors (Fed rates, DXY), "
+        "on-chain metrics, historical volatility. Base rates: crypto price targets "
+        "in 30 days hit ~30% in sideways markets, ~60% in strong trends."
+    ),
+    "politics": (
+        "You are a geopolitical analyst. Key factors: historical base rates for "
+        "similar events, current diplomatic/military situation, time pressure, "
+        "market consensus vs your assessment. Distinguish possible from probable. "
+        "Be skeptical of dramatic outcomes — base rates for military escalation "
+        "are low."
+    ),
+    "sports": (
+        "You are a sports betting analyst. Key factors: current form (last 5 games), "
+        "home/away advantage, head-to-head record, injuries and suspensions. "
+        "Sports markets are very efficient — edges are small. Default to market "
+        "price unless you have specific information suggesting mispricing."
+    ),
+    "economics": (
+        "You are a macro economist. Key factors: Fed policy, current commodity "
+        "prices, supply/demand fundamentals. Oil above $100 requires significant "
+        "supply shock — base rate is low in normal conditions."
+    ),
+    "entertainment": (
+        "You are an entertainment industry analyst. Key factors: awards season "
+        "history, critical reception, box office performance, industry buzz. "
+        "Consider historical base rates — frontrunners win Best Picture ~60% "
+        "of the time, upsets are common in acting categories."
+    ),
+}
+
+_DEFAULT_PROMPT = (
+    "You are a prediction market analyst. Assess the probability carefully "
+    "based on available evidence and base rates."
+)
+
+
+def _get_category_system_prompt(market: dict) -> str:
+    """Get category-specific system prompt for Claude calibration."""
+    cat = (market.get("category") or "").lower().strip()
+    return _CATEGORY_PROMPTS.get(cat, _DEFAULT_PROMPT)
+
 
 def _claude_calibrate(market: dict, sentiment: dict,
                       model_prob: float) -> dict:
@@ -136,11 +190,9 @@ def _claude_calibrate(market: dict, sentiment: dict,
         }
 
     market_block = format_market_for_claude(market, sentiment)
+    system_prompt = _get_category_system_prompt(market)
 
-    prompt = f"""You are a prediction market calibration expert. Review the model's
-probability estimate and either confirm or adjust it.
-
-{market_block}
+    prompt = f"""{market_block}
 
 MODEL ESTIMATE (YES probability): {model_prob:.4f}
 
@@ -158,6 +210,7 @@ Respond ONLY with valid JSON (no markdown):
         msg = client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=300,
+            system=system_prompt,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = msg.content[0].text.strip()
@@ -190,7 +243,7 @@ def predict(market: dict, sentiment: dict) -> Optional[dict]:
 
     Args:
         market:    Market dict (from DB).
-        sentiment: {"twitter": float, "reddit": float, "rss": float,
+        sentiment: {"news": float, "reddit": float, "rss": float,
                      "composite": float} from research_agent.
 
     Returns dict ready for risk_agent, or None if no tradeable edge.

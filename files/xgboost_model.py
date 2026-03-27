@@ -139,14 +139,27 @@ def fetch_resolved_markets(limit: int = 1000, min_volume: float = 500.0) -> list
 
         for m in data:
             # Skip non-binary markets
-            outcomes = m.get("outcomes")
-            if not outcomes or len(outcomes) < 2:
+            try:
+                outcomes = json.loads(m.get("outcomes", "[]")) if isinstance(m.get("outcomes"), str) else (m.get("outcomes") or [])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if len(outcomes) < 2:
                 continue
 
-            # Need a definitive resolution
-            resolution = m.get("resolution") or m.get("winner")
-            if not resolution:
+            # Determine resolution from outcomePrices — price "1" = winner
+            try:
+                prices = json.loads(m.get("outcomePrices", "[]")) if isinstance(m.get("outcomePrices"), str) else (m.get("outcomePrices") or [])
+            except (json.JSONDecodeError, TypeError):
                 continue
+            if len(prices) < 2:
+                continue
+            # A resolved market has one outcome at 1 and the other at 0
+            try:
+                p0, p1 = float(prices[0]), float(prices[1])
+            except (ValueError, TypeError):
+                continue
+            if not (p0 > 0.9 or p1 > 0.9):
+                continue  # not clearly resolved
 
             # Need minimum volume for signal quality
             vol = float(m.get("volume") or m.get("volumeNum") or 0)
@@ -170,8 +183,25 @@ def fetch_resolved_markets(limit: int = 1000, min_volume: float = 500.0) -> list
 def parse_resolution_label(market: dict) -> Optional[int]:
     """
     Parse the market resolution into a binary label.
-    Returns 1 if YES won, 0 if NO won, None if ambiguous.
+    Returns 1 if first outcome won (YES), 0 if second outcome won (NO), None if ambiguous.
+
+    Gamma API encodes resolution via outcomePrices: the winning outcome gets
+    price "1" and the loser gets "0". outcomes[0] is typically YES.
     """
+    # Primary method: outcomePrices — the resolved price tells us the winner
+    try:
+        prices_raw = market.get("outcomePrices", "[]")
+        prices = json.loads(prices_raw) if isinstance(prices_raw, str) else (prices_raw or [])
+        if len(prices) >= 2:
+            p0, p1 = float(prices[0]), float(prices[1])
+            if p0 > 0.9 and p1 < 0.1:
+                return 1   # first outcome (YES) won
+            if p1 > 0.9 and p0 < 0.1:
+                return 0   # second outcome (NO) won
+    except (json.JSONDecodeError, ValueError, TypeError):
+        pass
+
+    # Fallback: explicit resolution field (some older markets)
     resolution = (
         market.get("resolution") or
         market.get("winner") or
@@ -183,36 +213,36 @@ def parse_resolution_label(market: dict) -> Optional[int]:
     if resolution in ("NO", "0", "FALSE", "LOSE", "LOSS"):
         return 0
 
-    # Some markets resolve with the outcome text
-    outcomes = market.get("outcomes", [])
-    if isinstance(outcomes, list) and len(outcomes) >= 2:
-        yes_outcome = str(outcomes[0]).upper()
-        if resolution == yes_outcome:
-            return 1
-        no_outcome = str(outcomes[1]).upper()
-        if resolution == no_outcome:
-            return 0
-
     return None  # can't determine — skip this market
 
 
 def extract_yes_price_at_close(market: dict) -> float:
     """
     Extract the YES price near market close (the price the model would have seen).
-    Gamma stores this in various fields depending on market type.
+    For resolved markets, outcomePrices is 1/0 (post-resolution), so we use
+    lastTradePrice or bestBid as the pre-resolution price.
     """
-    # Try direct fields first
-    for field in ["lastTradePrice", "outcomePrices", "bestBid", "bestAsk"]:
+    # lastTradePrice is the most recent trade before resolution
+    ltp = market.get("lastTradePrice")
+    if ltp is not None:
+        try:
+            price = float(ltp)
+            if 0.01 <= price <= 0.99:
+                return price
+        except (ValueError, TypeError):
+            pass
+
+    # bestBid is another proxy
+    for field in ["bestBid", "bestAsk"]:
         val = market.get(field)
         if val is not None:
             try:
-                if isinstance(val, list):
-                    return float(val[0])   # first outcome = YES
-                return float(val)
+                price = float(val)
+                if 0.01 <= price <= 0.99:
+                    return price
             except (ValueError, TypeError):
                 pass
 
-    # Fall back to implied from volume/liquidity
     return 0.5  # unknown — center prior
 
 

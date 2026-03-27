@@ -94,7 +94,7 @@ def _days_until(iso_date: Optional[str]) -> Optional[int]:
     try:
         end = datetime.fromisoformat(iso_date.replace("Z", "+00:00"))
         now = datetime.now(timezone.utc)
-        return max(0, (end - now).days)
+        return (end - now).days  # negative = already expired
     except Exception:
         return None
 
@@ -240,7 +240,9 @@ def passes_filter(market: dict) -> bool:
         return False
 
     days = market.get("days_to_resolution")
-    if days is not None and days > RISK.max_days_to_resolution:
+    if days is None or days <= 0:
+        return False  # expired, resolves today, or unknown end date
+    if days > RISK.max_days_to_resolution:
         return False
 
     # Skip near-resolved markets (>95% or <5% — no edge)

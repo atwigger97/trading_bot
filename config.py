@@ -19,7 +19,6 @@ POLYMARKET_PRIVATE_KEY    = os.getenv("POLYMARKET_PRIVATE_KEY", "")   # Polygon 
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
-TWITTER_BEARER_TOKEN      = os.getenv("TWITTER_BEARER_TOKEN", "")
 REDDIT_CLIENT_ID          = os.getenv("REDDIT_CLIENT_ID", "")
 REDDIT_CLIENT_SECRET      = os.getenv("REDDIT_CLIENT_SECRET", "")
 REDDIT_USER_AGENT         = os.getenv("REDDIT_USER_AGENT", "prediction-bot/1.0")
@@ -32,7 +31,7 @@ POLYMARKET_CHAIN_ID   = 137   # Polygon mainnet
 
 # ─── CLAUDE MODEL ─────────────────────────────────────────────────────────────
 
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL = "claude-sonnet-4-6"
 
 # ─── RSS FEEDS ────────────────────────────────────────────────────────────────
 
@@ -42,6 +41,10 @@ RSS_FEEDS = [
     "https://feeds.reuters.com/reuters/topNews",
     "https://www.politico.com/rss/politicopicks.xml",
     "https://cryptonews.com/news/feed/",
+    "https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml",
+    "https://feeds.bbci.co.uk/news/business/rss.xml",
+    "https://www.aljazeera.com/xml/rss/all.xml",
+    "https://feeds.npr.org/1001/rss.xml",
 ]
 
 # ─── TRADING PARAMETERS ──────────────────────────────────────────────────────
@@ -51,24 +54,40 @@ class RiskConfig:
     """Risk management parameters."""
     # Kelly Criterion
     kelly_fraction: float = 0.25        # fractional Kelly (0.25 = quarter Kelly - conservative)
-    max_kelly_bet_pct: float = 0.05     # hard cap: never risk more than 5% of bankroll per trade
+    max_kelly_bet_pct: float = 0.10     # hard cap: never risk more than 10% of bankroll per trade
 
     # Exposure limits
-    max_single_position_usdc: float = 500.0   # max $ per position
-    max_total_exposure_usdc: float  = 2000.0  # max $ across all open positions
-    daily_loss_limit_usdc: float    = 300.0   # bot pauses if daily loss exceeds this
+    max_single_position_usdc: float = 15.0    # max $ per position
+    max_total_exposure_usdc: float  = 100.0   # max $ across all open positions
+    daily_loss_limit_usdc: float    = 25.0    # bot pauses if daily loss exceeds this
+
+    # Duration-aware exposure split
+    max_long_exposure_pct: float  = 0.40     # max 40% of exposure on markets > 3 days
+    long_threshold_days: int      = 3        # markets > this are "long"
 
     # Edge filter - only trade if edge > threshold
-    min_edge_pct: float = 0.04          # 4% minimum edge (our_prob - market_prob)
-    min_liquidity_usdc: float = 1000.0  # minimum market liquidity to consider
-    min_volume_24h_usdc: float = 500.0  # minimum 24h volume
-    max_days_to_resolution: int = 30    # don't trade markets resolving > 30 days out
+    min_edge_pct: float = 0.06          # 6% minimum edge (our_prob - market_prob)
+    min_liquidity_usdc: float = 2000.0  # minimum market liquidity to consider
+    min_volume_24h_usdc: float = 1000.0 # minimum 24h volume
+    max_days_to_resolution: int = 3     # focus on 1-3 day markets only
 
     # Sentiment weights for probability adjustment
     sentiment_weight: float = 0.15      # how much sentiment shifts XGBoost prediction
 
     # Bankroll
-    bankroll_usdc: float = 1000.0       # starting / current bankroll
+    bankroll_usdc: float = 97.47       # starting / current bankroll
+
+    # Time horizon scoring weights (multiply opportunity_score)
+    time_horizon_weights: dict = None
+
+    def __post_init__(self):
+        if self.time_horizon_weights is None:
+            self.time_horizon_weights = {
+                'same_day': 2.0,   # resolves within 24h
+                'short':    1.5,   # 1-3 days
+                'medium':   1.0,   # 3-7 days
+                'long':     0.5,   # 7-30 days
+            }
 
 
 @dataclass
@@ -85,8 +104,8 @@ class FilterConfig:
         """Initialize default categories if not provided."""
         if self.target_categories is None:
             self.target_categories = [
-                "politics", "crypto", "sports",
-                "economics", "science", "entertainment"
+                "sports", "crypto",
+                "economics", "politics",
             ]
 
 

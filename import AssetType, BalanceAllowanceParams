@@ -1,0 +1,45 @@
+Help on class BalanceAllowanceParams in module py_clob_client.clob_types:
+
+class BBaallaanncceeAAlllloowwaanncceePPaarraammss(builtins.object)
+ |  BalanceAllowanceParams(asset_type: py_clob_client.clob_types.AssetType = None, token_id: str = None, signature_type: int = -1) -> None
+ |
+ |  BalanceAllowanceParams(asset_type: py_clob_client.clob_types.AssetType = None, token_id: str = None, signature_type: int = -1)
+ |
+ |  Methods defined here:
+ |
+ |  ____eeqq____(self, other)
+ |      Return self==value.
+ |
+ |  ____iinniitt____(self, asset_type: py_clob_client.clob_types.AssetType = None, token_id: str = None, signature_type: int = -1) -> None
+ |      Initialize self.  See help(type(self)) for accurate signature.
+ |
+ |  ____rreepprr____(self)
+ |      Return repr(self).
+ |
+ |  ----------------------------------------------------------------------
+ |  Data descriptors defined here:
+ |
+ |  ____ddiicctt____
+ |      dictionary for instance variables
+ |
+ |  ____wweeaakkrreeff____
+ |      list of weak references to the object
+ |
+ |  ----------------------------------------------------------------------
+ |  Data and other attributes defined here:
+ |
+ |  ____aannnnoottaattiioonnss____ = {'asset_type': <class 'py_clob_client.clob_types.Ass...
+ |
+ |  ____ddaattaaccllaassss__ffiieellddss____ = {'asset_type': Field(name='asset_type',type=<cl...
+ |
+ |  ____ddaattaaccllaassss__ppaarraammss____ = _DataclassParams(init=True,repr=True,eq=True,or...
+ |
+ |  ____hhaasshh____ = None
+ |
+ |  ____mmaattcchh__aarrggss____ = ('asset_type', 'token_id', 'signature_type')
+ |
+ |  aasssseett__ttyyppee = None
+ |
+ |  ssiiggnnaattuurree__ttyyppee = -1
+ |
+ |  ttookkeenn__iidd = None

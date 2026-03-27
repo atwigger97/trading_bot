@@ -2,11 +2,12 @@
 agents/filter_agent.py — Market opportunity scoring and ranking.
 
 Pulls active markets from the DB, scores each on volume, liquidity,
-days_to_resolution, and sentiment variance, then returns the top N
+days_to_resolution, and category, then returns the top N
 candidates sorted by opportunity score.
 
-Opportunity formula:
-    (volume_score * 0.4) + (liquidity_score * 0.3) + (time_score * 0.3)
+Focuses on short-duration, high-accuracy categories:
+  sports (1-day), crypto price targets (1-3 day),
+  economic data releases (1-2 day), political deadlines (2-3 day).
 
 Public API:
     rank_markets(top_n) → list[dict]  (markets enriched w/ opportunity_score)
@@ -22,12 +23,24 @@ logger = logging.getLogger(__name__)
 
 # ─── NORMALIZATION BOUNDS ────────────────────────────────────────────────────
 
-_VOL_MIN   = 500.0
+_VOL_MIN   = 1_000.0
 _VOL_MAX   = 100_000.0
-_LIQ_MIN   = 1_000.0
+_LIQ_MIN   = 2_000.0
 _LIQ_MAX   = 200_000.0
 _DAYS_MIN  = 1
-_DAYS_MAX  = 30
+_DAYS_MAX  = 3
+
+# Category multipliers — prioritise categories with higher accuracy
+_CATEGORY_MULTIPLIERS = {
+    'sports':       1.3,
+    'crypto':       1.2,
+    'economics':    1.2,
+    'politics':     0.9,   # open-ended geopolitics deprioritised
+    'finance':      1.0,
+    'entertainment': 0.5,  # avoid
+    'science':      0.7,
+    'technology':   0.7,
+}
 
 
 def _volume_score(market: dict) -> float:
@@ -43,20 +56,33 @@ def _liquidity_score(market: dict) -> float:
 def _time_score(market: dict) -> float:
     """
     Score 0-1 based on days to resolution.
-    Sweet spot is 3-14 days; very soon or very far out score lower.
+    Heavily favours same-day and short-duration markets.
     """
     days = market.get("days_to_resolution")
-    if days is None:
-        return 0.3
-    if days <= 0:
+    if days is None or days <= 0:
         return 0.0
-    if days <= 2:
-        return 0.6
+    if days <= 1:
+        return 1.0    # same day — top priority
+    if days <= 3:
+        return 0.85   # 1-3 days
+    if days <= 7:
+        return 0.65   # weekly
     if days <= 14:
-        return 1.0
-    if days <= 30:
-        return 1.0 - 0.6 * ((days - 14) / 16)
-    return 0.2
+        return 0.35   # biweekly
+    return 0.15           # monthly — deprioritised
+
+
+def _horizon_bucket(days) -> str:
+    """Classify days_to_resolution into a time bucket."""
+    if days is None or days <= 0:
+        return 'long'
+    if days <= 1:
+        return 'same_day'
+    if days <= 3:
+        return 'short'
+    if days <= 7:
+        return 'medium'
+    return 'long'
 
 
 def _sentiment_bonus(condition_id: str) -> float:
@@ -77,14 +103,24 @@ def _sentiment_bonus(condition_id: str) -> float:
 
 
 def opportunity_score(market: dict) -> float:
-    """Composite opportunity score for a single market."""
+    """Composite opportunity score with category + time horizon multipliers."""
     vol  = _volume_score(market)
     liq  = _liquidity_score(market)
     tim  = _time_score(market)
     bonus = _sentiment_bonus(market["condition_id"])
 
-    score = (vol * 0.4) + (liq * 0.3) + (tim * 0.3) + bonus
-    return round(score, 4)
+    base = (vol * 0.30) + (liq * 0.25) + (tim * 0.45) + bonus
+
+    # Apply time-horizon multiplier
+    days = market.get("days_to_resolution")
+    bucket = _horizon_bucket(days)
+    time_weight = RISK.time_horizon_weights.get(bucket, 1.0)
+
+    # Apply category multiplier
+    cat = (market.get("category") or "").lower().strip()
+    cat_weight = _CATEGORY_MULTIPLIERS.get(cat, 0.7)
+
+    return round(base * time_weight * cat_weight, 4)
 
 
 def _passes_prefilter(market: dict) -> bool:
@@ -93,12 +129,30 @@ def _passes_prefilter(market: dict) -> bool:
         return False
     if market.get("liquidity_usdc", 0) < RISK.min_liquidity_usdc:
         return False
+
     yes_p = market.get("yes_price", 0.5)
-    if yes_p > 0.95 or yes_p < 0.05:
+    no_p  = market.get("no_price", 0.5)
+
+    # No-edge price zones
+    if yes_p > 0.85 or yes_p < 0.15:
         return False
+
+    # Spread check — wide spread = illiquid/broken market
+    spread_sum = yes_p + no_p
+    if spread_sum < 0.90 or spread_sum > 1.10:
+        return False
+
     days = market.get("days_to_resolution")
-    if days is not None and days > RISK.max_days_to_resolution:
+    if days is None or days <= 0:
+        return False  # expired, resolves today, or unknown end date
+    if days > RISK.max_days_to_resolution:
         return False
+
+    # Category gate — skip entertainment/science junk
+    cat = (market.get("category") or "").lower().strip()
+    if cat in ("entertainment",):
+        return False
+
     return True
 
 
@@ -125,8 +179,13 @@ def rank_markets(top_n: int = None) -> list[dict]:
 
     for m in eligible:
         m["opportunity_score"] = opportunity_score(m)
+        m["_horizon_bucket"] = _horizon_bucket(m.get("days_to_resolution"))
 
-    eligible.sort(key=lambda m: m["opportunity_score"], reverse=True)
+    # Sort: short-duration first at similar scores (bucket priority, then score)
+    bucket_order = {'same_day': 0, 'short': 1, 'medium': 2, 'long': 3}
+    eligible.sort(
+        key=lambda m: (-m["opportunity_score"], bucket_order.get(m["_horizon_bucket"], 3))
+    )
     candidates = eligible[:top_n]
 
     for m in candidates:

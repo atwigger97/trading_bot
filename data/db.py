@@ -162,13 +162,14 @@ def upsert_market(market: dict):
                 datetime('now')
             )
             ON CONFLICT(condition_id) DO UPDATE SET
-                yes_price        = excluded.yes_price,
-                no_price         = excluded.no_price,
-                volume_24h_usdc  = CASE WHEN excluded.volume_24h_usdc > 0 THEN excluded.volume_24h_usdc ELSE markets.volume_24h_usdc END,
-                liquidity_usdc   = CASE WHEN excluded.liquidity_usdc > 0 THEN excluded.liquidity_usdc ELSE markets.liquidity_usdc END,
-                active           = excluded.active,
-                closed           = excluded.closed,
-                last_updated     = datetime('now')
+                yes_price           = excluded.yes_price,
+                no_price            = excluded.no_price,
+                volume_24h_usdc     = CASE WHEN excluded.volume_24h_usdc > 0 THEN excluded.volume_24h_usdc ELSE markets.volume_24h_usdc END,
+                liquidity_usdc      = CASE WHEN excluded.liquidity_usdc > 0 THEN excluded.liquidity_usdc ELSE markets.liquidity_usdc END,
+                active              = excluded.active,
+                closed              = excluded.closed,
+                days_to_resolution  = excluded.days_to_resolution,
+                last_updated        = datetime('now')
         """, market)
 
 
@@ -180,7 +181,8 @@ def get_active_markets(min_liquidity: float = 0, min_volume: float = 0,
         WHERE active = 1 AND closed = 0
           AND liquidity_usdc >= ?
           AND volume_24h_usdc >= ?
-          AND (days_to_resolution IS NULL OR days_to_resolution <= ?)
+          AND days_to_resolution > 0
+          AND days_to_resolution <= ?
     """
     params = [min_liquidity, min_volume, max_days]
     if category:
@@ -366,3 +368,57 @@ def snapshot_bankroll(usdc_balance: float, open_positions: float):
             INSERT INTO bankroll (usdc_balance, open_positions, total_equity)
             VALUES (?, ?, ?)
         """, (usdc_balance, open_positions, usdc_balance + open_positions))
+
+
+def get_performance_stats() -> dict:
+    """Comprehensive performance metrics for status display."""
+    with get_conn() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+
+        resolved = conn.execute("""
+            SELECT COUNT(*),
+                   SUM(CASE WHEN pnl_usdc > 0 THEN 1 ELSE 0 END),
+                   SUM(pnl_usdc),
+                   AVG(pnl_usdc)
+            FROM trades
+            WHERE status='filled' AND pnl_usdc IS NOT NULL
+        """).fetchone()
+
+        resolved_count = resolved[0] or 0
+        wins = resolved[1] or 0
+        win_rate = wins / resolved_count if resolved_count > 0 else 0
+
+        best = conn.execute("""
+            SELECT m.question, t.pnl_usdc FROM trades t
+            JOIN markets m ON m.condition_id = t.condition_id
+            WHERE t.pnl_usdc IS NOT NULL
+            ORDER BY t.pnl_usdc DESC LIMIT 1
+        """).fetchone()
+
+        worst = conn.execute("""
+            SELECT m.question, t.pnl_usdc FROM trades t
+            JOIN markets m ON m.condition_id = t.condition_id
+            WHERE t.pnl_usdc IS NOT NULL
+            ORDER BY t.pnl_usdc ASC LIMIT 1
+        """).fetchone()
+
+        categories = conn.execute("""
+            SELECT m.category,
+                   COUNT(*) as trades,
+                   SUM(t.pnl_usdc) as pnl
+            FROM trades t
+            JOIN markets m ON m.condition_id = t.condition_id
+            WHERE t.pnl_usdc IS NOT NULL
+            GROUP BY m.category
+        """).fetchall()
+
+        return {
+            "total_trades": total,
+            "resolved_trades": resolved_count,
+            "win_rate": win_rate,
+            "total_pnl": resolved[2] or 0,
+            "avg_pnl_per_trade": resolved[3] or 0,
+            "best_trade": dict(best) if best else None,
+            "worst_trade": dict(worst) if worst else None,
+            "category_breakdown": [dict(c) for c in categories],
+        }
